@@ -166,6 +166,13 @@ func (api *WhatsAppAPI) eventHandler(evt interface{}) {
 			api.currentQR = v.Codes[0]
 			api.log.Infof("QR code updated: %s", api.currentQR)
 		}
+	case *events.PairSuccess:
+		api.log.Infof("Pairing successful! Device: %s, Business: %s, Platform: %s", 
+			v.ID.String(), v.BusinessName, v.Platform)
+	case *events.PairError:
+		api.log.Errorf("Pairing failed! Device: %s, Error: %v", v.ID.String(), v.Error)
+	case *events.Connected:
+		api.log.Infof("WhatsApp client connected successfully!")
 	}
 }
 
