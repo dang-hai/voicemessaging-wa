@@ -3,47 +3,43 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
+	"whatsapp-wrapper/database"
+	"whatsapp-wrapper/session"
+
 	"github.com/gorilla/mux"
-	_ "github.com/mattn/go-sqlite3"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/store/sqlstore"
-	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
-type WhatsAppAPI struct {
-	client     *whatsmeow.Client
-	log        waLog.Logger
-	messages   []MessageInfo
-	currentQR  string
+type MultiSessionAPI struct {
+	sessionManager *session.SessionManager
+	supabase       database.SupabaseStore
+	log            waLog.Logger
 }
 
-type MessageInfo struct {
-	ID        string          `json:"id"`
-	Timestamp time.Time       `json:"timestamp"`
-	Source    MessageSource   `json:"source"`
-	Content   MessageContent  `json:"content"`
-	IsRead    bool           `json:"is_read"`
+type CreateSessionRequest struct {
+	PhoneNumber string `json:"phone_number"`
 }
 
-type MessageSource struct {
-	Chat     string `json:"chat"`
-	Sender   string `json:"sender"`
-	IsFromMe bool   `json:"is_from_me"`
-	IsGroup  bool   `json:"is_group"`
+type CreateSessionResponse struct {
+	PhoneNumber string `json:"phone_number"`
+	SessionID   string `json:"session_id"`
+	Status      string `json:"status"`
 }
 
-type MessageContent struct {
-	Text string `json:"text,omitempty"`
-	Type string `json:"type"`
+type SessionStatusResponse struct {
+	PhoneNumber string `json:"phone_number"`
+	Status      string `json:"status"`
+	LastSeen    string `json:"last_seen,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 type QRResponse struct {
@@ -56,7 +52,11 @@ type AuthStatusResponse struct {
 }
 
 type MessagesResponse struct {
-	Messages []MessageInfo `json:"messages"`
+	Messages []*database.Message `json:"messages"`
+}
+
+type SessionListResponse struct {
+	Sessions []*database.Session `json:"sessions"`
 }
 
 type ReadStatusRequest struct {
@@ -74,41 +74,48 @@ type PairCodeResponse struct {
 }
 
 func main() {
-	dbLog := waLog.Stdout("Database", "INFO", true)
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:whatsapp.db?_foreign_keys=on", dbLog)
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = "postgres://postgres:password@localhost:5432/whatsapp?sslmode=disable"
+	}
+
+	supabaseDB, err := database.NewSupabaseDB(databaseURL)
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to connect to Supabase: %v", err)
 	}
 
-	deviceStore, err := container.GetFirstDevice(context.Background())
+	clientLog := waLog.Stdout("SessionManager", "INFO", true)
+	sessionManager, err := session.NewSessionManager(supabaseDB, databaseURL, clientLog)
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to create session manager: %v", err)
 	}
 
-	clientLog := waLog.Stdout("Client", "INFO", true)
-	client := whatsmeow.NewClient(deviceStore, clientLog)
-
-	api := &WhatsAppAPI{
-		client:    client,
-		log:       clientLog,
-		messages:  make([]MessageInfo, 0),
-		currentQR: "",
+	api := &MultiSessionAPI{
+		sessionManager: sessionManager,
+		supabase:       supabaseDB,
+		log:            clientLog,
 	}
-
-	client.AddEventHandler(api.eventHandler)
 
 	router := mux.NewRouter()
 	
-	// Authentication endpoints
-	router.HandleFunc("/qr", api.getQR).Methods("GET")
-	router.HandleFunc("/auth/status", api.getAuthStatus).Methods("GET")
-	router.HandleFunc("/auth/logout", api.logout).Methods("POST")
-	router.HandleFunc("/auth/pair-phone", api.pairPhone).Methods("POST")
+	// Session management endpoints
+	router.HandleFunc("/sessions/create", api.createSession).Methods("POST")
+	router.HandleFunc("/sessions/list", api.listSessions).Methods("GET")
+	router.HandleFunc("/sessions/{phone}/status", api.getSessionStatus).Methods("GET")
+	router.HandleFunc("/sessions/{phone}/connect", api.connectSession).Methods("POST")
+	router.HandleFunc("/sessions/{phone}/disconnect", api.disconnectSession).Methods("POST")
+	router.HandleFunc("/sessions/{phone}/delete", api.deleteSession).Methods("DELETE")
 	
-	// Message endpoints
-	router.HandleFunc("/messages", api.getMessages).Methods("GET")
-	router.HandleFunc("/messages/{chatId}", api.getChatMessages).Methods("GET")
-	router.HandleFunc("/messages/read-status", api.updateReadStatus).Methods("POST")
+	// Authentication endpoints (phone-scoped)
+	router.HandleFunc("/sessions/{phone}/qr", api.getQR).Methods("GET")
+	router.HandleFunc("/sessions/{phone}/auth/status", api.getAuthStatus).Methods("GET")
+	router.HandleFunc("/sessions/{phone}/auth/pair-phone", api.pairPhone).Methods("POST")
+	
+	// Message endpoints (phone-scoped)
+	router.HandleFunc("/sessions/{phone}/messages", api.getMessages).Methods("GET")
+	router.HandleFunc("/sessions/{phone}/messages/{chatId}", api.getChatMessages).Methods("GET")
+	router.HandleFunc("/sessions/{phone}/messages/read-status", api.updateReadStatus).Methods("POST")
+	router.HandleFunc("/sessions/{phone}/messages/unread-count", api.getUnreadCount).Methods("GET")
 	
 	server := &http.Server{
 		Addr:    ":8080",
@@ -116,7 +123,7 @@ func main() {
 	}
 
 	go func() {
-		log.Println("Starting server on :8080")
+		log.Println("Starting multi-session WhatsApp API server on :8080")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed to start: %v", err)
 		}
@@ -125,152 +132,19 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
-	if client.Store.ID == nil {
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			panic(err)
-		}
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				api.log.Infof("QR code: %s", evt.Code)
-			} else {
-				api.log.Infof("QR channel result: %s", evt.Event)
-			}
-		}
-	} else {
-		err = client.Connect()
-		if err != nil {
-			panic(err)
-		}
-	}
-
 	<-c
 	log.Println("Shutting down server...")
 	
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	
-	client.Disconnect()
+	sessionManager.Close()
 	server.Shutdown(ctx)
 }
 
-func (api *WhatsAppAPI) eventHandler(evt interface{}) {
-	switch v := evt.(type) {
-	case *events.Message:
-		api.handleMessage(v)
-	case *events.Receipt:
-		api.handleReceipt(v)
-	case *events.QR:
-		if len(v.Codes) > 0 {
-			api.currentQR = v.Codes[0]
-			api.log.Infof("QR code updated: %s", api.currentQR)
-		}
-	case *events.PairSuccess:
-		api.log.Infof("Pairing successful! Device: %s, Business: %s, Platform: %s", 
-			v.ID.String(), v.BusinessName, v.Platform)
-	case *events.PairError:
-		api.log.Errorf("Pairing failed! Device: %s, Error: %v", v.ID.String(), v.Error)
-	case *events.Connected:
-		api.log.Infof("WhatsApp client connected successfully!")
-	}
-}
-
-func (api *WhatsAppAPI) handleMessage(evt *events.Message) {
-	msg := MessageInfo{
-		ID:        evt.Info.ID,
-		Timestamp: evt.Info.Timestamp,
-		Source: MessageSource{
-			Chat:     evt.Info.Chat.String(),
-			Sender:   evt.Info.Sender.String(),
-			IsFromMe: evt.Info.IsFromMe,
-			IsGroup:  evt.Info.IsGroup,
-		},
-		IsRead: false,
-	}
-
-	if evt.Message.GetConversation() != "" {
-		msg.Content = MessageContent{
-			Text: evt.Message.GetConversation(),
-			Type: "text",
-		}
-	} else if evt.Message.GetExtendedTextMessage() != nil {
-		msg.Content = MessageContent{
-			Text: evt.Message.GetExtendedTextMessage().GetText(),
-			Type: "text",
-		}
-	} else {
-		msg.Content = MessageContent{
-			Type: "other",
-		}
-	}
-
-	api.messages = append(api.messages, msg)
-	api.log.Infof("Received message: %s from %s", msg.Content.Text, msg.Source.Sender)
-}
-
-func (api *WhatsAppAPI) handleReceipt(evt *events.Receipt) {
-	if evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf {
-		for i, msg := range api.messages {
-			if msg.ID == evt.MessageIDs[0] {
-				api.messages[i].IsRead = true
-				break
-			}
-		}
-	}
-}
-
-func (api *WhatsAppAPI) getQR(w http.ResponseWriter, r *http.Request) {
-	if api.client.Store.ID != nil {
-		http.Error(w, "Already authenticated", http.StatusBadRequest)
-		return
-	}
-
-	if api.currentQR == "" {
-		http.Error(w, "QR code not available", http.StatusNotFound)
-		return
-	}
-
-	response := QRResponse{QR: api.currentQR}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func (api *WhatsAppAPI) getAuthStatus(w http.ResponseWriter, r *http.Request) {
-	response := AuthStatusResponse{
-		IsAuthenticated: api.client.Store.ID != nil,
-	}
-	
-	if response.IsAuthenticated && api.client.Store.ID != nil {
-		response.Phone = api.client.Store.ID.User
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func (api *WhatsAppAPI) logout(w http.ResponseWriter, r *http.Request) {
-	if api.client.Store.ID == nil {
-		http.Error(w, "Not authenticated", http.StatusBadRequest)
-		return
-	}
-
-	err := api.client.Logout(context.Background())
-	if err != nil {
-		http.Error(w, "Failed to logout", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-}
-
-func (api *WhatsAppAPI) pairPhone(w http.ResponseWriter, r *http.Request) {
-	if api.client.Store.ID != nil {
-		http.Error(w, "Already authenticated", http.StatusBadRequest)
-		return
-	}
-
-	var req PairPhoneRequest
+// Session management handlers
+func (api *MultiSessionAPI) createSession(w http.ResponseWriter, r *http.Request) {
+	var req CreateSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
@@ -281,20 +155,155 @@ func (api *WhatsAppAPI) pairPhone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !api.client.IsConnected() {
-		err := api.client.Connect()
-		if err != nil {
-			http.Error(w, "Failed to connect", http.StatusInternalServerError)
-			return
-		}
-		// Wait a moment for connection to stabilize
-		time.Sleep(time.Second)
+	session, err := api.sessionManager.CreateSession(req.PhoneNumber)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create session: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	pairCode, err := api.client.PairPhone(context.Background(), req.PhoneNumber, req.ShowNotification, whatsmeow.PairClientChrome, "Chrome (Windows)")
+	sessionID := "pending"
+	if session.Client.Store.ID != nil {
+		sessionID = session.Client.Store.ID.String()
+	}
+
+	response := CreateSessionResponse{
+		PhoneNumber: session.PhoneNumber,
+		SessionID:   sessionID,
+		Status:      string(session.Status),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (api *MultiSessionAPI) listSessions(w http.ResponseWriter, r *http.Request) {
+	sessions, err := api.sessionManager.ListSessions()
 	if err != nil {
-		api.log.Errorf("Failed to generate pair code: %v", err)
-		http.Error(w, "Failed to generate pair code", http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to list sessions: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	response := SessionListResponse{Sessions: sessions}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (api *MultiSessionAPI) getSessionStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+
+	status, err := api.sessionManager.GetSessionStatus(phoneNumber)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Session not found: %v", err), http.StatusNotFound)
+		return
+	}
+
+	session, _ := api.sessionManager.GetSession(phoneNumber)
+	response := SessionStatusResponse{
+		PhoneNumber: phoneNumber,
+		Status:      string(status),
+		LastSeen:    session.LastSeen.Format(time.RFC3339),
+	}
+
+	if session.ErrorMessage != "" {
+		response.Error = session.ErrorMessage
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (api *MultiSessionAPI) connectSession(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+
+	err := api.sessionManager.ConnectSession(phoneNumber)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to connect session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (api *MultiSessionAPI) disconnectSession(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+
+	err := api.sessionManager.DisconnectSession(phoneNumber)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to disconnect session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (api *MultiSessionAPI) deleteSession(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+
+	err := api.sessionManager.DeleteSession(phoneNumber)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to delete session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// Authentication handlers (phone-scoped)
+func (api *MultiSessionAPI) getQR(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+
+	qrCode, err := api.sessionManager.GetQRCode(phoneNumber)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get QR code: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	response := QRResponse{QR: qrCode}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (api *MultiSessionAPI) getAuthStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+
+	session, err := api.sessionManager.GetSession(phoneNumber)
+	if err != nil {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	response := AuthStatusResponse{
+		IsAuthenticated: session.Status == "authenticated",
+		Phone:          phoneNumber,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (api *MultiSessionAPI) pairPhone(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+
+	var req PairPhoneRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.PhoneNumber == "" {
+		req.PhoneNumber = phoneNumber
+	}
+
+	pairCode, err := api.sessionManager.PairPhone(phoneNumber, req.PhoneNumber, req.ShowNotification)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to generate pair code: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -303,43 +312,57 @@ func (api *WhatsAppAPI) pairPhone(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func (api *WhatsAppAPI) getMessages(w http.ResponseWriter, r *http.Request) {
-	if api.client.Store.ID == nil {
-		http.Error(w, "Not authenticated", http.StatusUnauthorized)
-		return
-	}
-
-	response := MessagesResponse{Messages: api.messages}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func (api *WhatsAppAPI) getChatMessages(w http.ResponseWriter, r *http.Request) {
-	if api.client.Store.ID == nil {
-		http.Error(w, "Not authenticated", http.StatusUnauthorized)
-		return
-	}
-
+// Message handlers (phone-scoped)
+func (api *MultiSessionAPI) getMessages(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	chatId := vars["chatId"]
+	phoneNumber := vars["phone"]
 
-	var chatMessages []MessageInfo
-	for _, msg := range api.messages {
-		if msg.Source.Chat == chatId {
-			chatMessages = append(chatMessages, msg)
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50 // default
+	if limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
 		}
 	}
 
-	response := MessagesResponse{Messages: chatMessages}
+	messages, err := api.supabase.GetMessages(phoneNumber, limit)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get messages: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	response := MessagesResponse{Messages: messages}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
-func (api *WhatsAppAPI) updateReadStatus(w http.ResponseWriter, r *http.Request) {
-	if api.client.Store.ID == nil {
-		http.Error(w, "Not authenticated", http.StatusUnauthorized)
+func (api *MultiSessionAPI) getChatMessages(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+	chatID := vars["chatId"]
+
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50 // default
+	if limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+		}
+	}
+
+	messages, err := api.supabase.GetChatMessages(phoneNumber, chatID, limit)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get chat messages: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	response := MessagesResponse{Messages: messages}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (api *MultiSessionAPI) updateReadStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
 
 	var req ReadStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -347,34 +370,27 @@ func (api *WhatsAppAPI) updateReadStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	for i, msg := range api.messages {
-		if msg.ID == req.MessageID {
-			api.messages[i].IsRead = req.Read
-			
-			if req.Read {
-				chatJID, err := types.ParseJID(msg.Source.Chat)
-				if err != nil {
-					http.Error(w, "Invalid chat JID", http.StatusBadRequest)
-					return
-				}
-
-				senderJID, err := types.ParseJID(msg.Source.Sender)
-				if err != nil {
-					http.Error(w, "Invalid sender JID", http.StatusBadRequest)
-					return
-				}
-
-				err = api.client.MarkRead([]string{req.MessageID}, time.Now(), chatJID, senderJID)
-				if err != nil {
-					http.Error(w, "Failed to mark as read", http.StatusInternalServerError)
-					return
-				}
-			}
-			
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+	err := api.supabase.UpdateMessageReadStatus(phoneNumber, req.MessageID, req.Read)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update read status: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	http.Error(w, "Message not found", http.StatusNotFound)
+	w.WriteHeader(http.StatusOK)
 }
+
+func (api *MultiSessionAPI) getUnreadCount(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	phoneNumber := vars["phone"]
+
+	count, err := api.supabase.GetUnreadMessageCount(phoneNumber)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get unread count: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	response := map[string]int{"unread_count": count}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+

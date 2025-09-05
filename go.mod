@@ -6,7 +6,7 @@ toolchain go1.24.2
 
 require (
 	github.com/gorilla/mux v1.8.0
-	github.com/mattn/go-sqlite3 v1.14.32
+	github.com/lib/pq v1.10.9
 	go.mau.fi/whatsmeow v0.0.0-20240625083845-6acab596dd8c
 )
 
