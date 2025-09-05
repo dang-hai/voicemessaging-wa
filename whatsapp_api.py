@@ -41,6 +41,13 @@ class ReadStatusUpdate(BaseModel):
 class MessagesResponse(BaseModel):
     messages: List[Message]
 
+class PairPhoneRequest(BaseModel):
+    phone_number: str
+    show_notification: bool = True
+
+class PairCodeResponse(BaseModel):
+    pair_code: str
+
 async def get_http_client():
     return httpx.AsyncClient(timeout=30.0)
 
@@ -102,6 +109,30 @@ async def logout():
                 raise HTTPException(status_code=400, detail="Not authenticated")
             else:
                 raise HTTPException(status_code=500, detail="Failed to logout")
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Go service unavailable")
+
+@app.post("/auth/pair-phone", response_model=PairCodeResponse)
+async def pair_phone(pair_request: PairPhoneRequest):
+    """Generate pairing code for phone number authentication"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{GO_SERVICE_URL}/auth/pair-phone",
+                json=pair_request.dict()
+            )
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 400:
+                error_text = response.text
+                if "Already authenticated" in error_text:
+                    raise HTTPException(status_code=400, detail="Already authenticated")
+                elif "Phone number is required" in error_text:
+                    raise HTTPException(status_code=400, detail="Phone number is required")
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid phone number format")
+            else:
+                raise HTTPException(status_code=500, detail="Failed to generate pairing code")
     except httpx.RequestError:
         raise HTTPException(status_code=503, detail="Go service unavailable")
 

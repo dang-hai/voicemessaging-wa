@@ -64,6 +64,15 @@ type ReadStatusRequest struct {
 	Read      bool   `json:"read"`
 }
 
+type PairPhoneRequest struct {
+	PhoneNumber    string `json:"phone_number"`
+	ShowNotification bool `json:"show_notification"`
+}
+
+type PairCodeResponse struct {
+	PairCode string `json:"pair_code"`
+}
+
 func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:whatsapp.db?_foreign_keys=on", dbLog)
@@ -94,6 +103,7 @@ func main() {
 	router.HandleFunc("/qr", api.getQR).Methods("GET")
 	router.HandleFunc("/auth/status", api.getAuthStatus).Methods("GET")
 	router.HandleFunc("/auth/logout", api.logout).Methods("POST")
+	router.HandleFunc("/auth/pair-phone", api.pairPhone).Methods("POST")
 	
 	// Message endpoints
 	router.HandleFunc("/messages", api.getMessages).Methods("GET")
@@ -245,6 +255,45 @@ func (api *WhatsAppAPI) logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (api *WhatsAppAPI) pairPhone(w http.ResponseWriter, r *http.Request) {
+	if api.client.Store.ID != nil {
+		http.Error(w, "Already authenticated", http.StatusBadRequest)
+		return
+	}
+
+	var req PairPhoneRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.PhoneNumber == "" {
+		http.Error(w, "Phone number is required", http.StatusBadRequest)
+		return
+	}
+
+	if !api.client.IsConnected() {
+		err := api.client.Connect()
+		if err != nil {
+			http.Error(w, "Failed to connect", http.StatusInternalServerError)
+			return
+		}
+		// Wait a moment for connection to stabilize
+		time.Sleep(time.Second)
+	}
+
+	pairCode, err := api.client.PairPhone(context.Background(), req.PhoneNumber, req.ShowNotification, whatsmeow.PairClientChrome, "Chrome (Windows)")
+	if err != nil {
+		api.log.Errorf("Failed to generate pair code: %v", err)
+		http.Error(w, "Failed to generate pair code", http.StatusInternalServerError)
+		return
+	}
+
+	response := PairCodeResponse{PairCode: pairCode}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func (api *WhatsAppAPI) getMessages(w http.ResponseWriter, r *http.Request) {
